@@ -1,2 +1,6 @@
 # If true, game mode is also stored/swapped per world group, not just inventory-related state.
 sync-game-mode: false
+
+# If true, logs every join/quit/group-swap decision with an [apw-debug] prefix - useful when
+# something isn't behaving as expected. Leave off for normal use, it's noisy.
+debug: false

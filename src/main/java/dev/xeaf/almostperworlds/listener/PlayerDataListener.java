@@ -34,15 +34,21 @@ public final class PlayerDataListener implements Listener {
     private final Plugin plugin;
     private final GroupManager groupManager;
     private final boolean syncGameMode;
+    private final boolean debug;
 
     /** The world each online player was in as of the last poll, so we can detect a change. */
     private final Map<UUID, String> lastKnownWorld = new ConcurrentHashMap<>();
     private io.papermc.paper.threadedregions.scheduler.ScheduledTask pollingTask;
 
-    public PlayerDataListener(Plugin plugin, GroupManager groupManager, boolean syncGameMode) {
+    public PlayerDataListener(Plugin plugin, GroupManager groupManager, boolean syncGameMode, boolean debug) {
         this.plugin = plugin;
         this.groupManager = groupManager;
         this.syncGameMode = syncGameMode;
+        this.debug = debug;
+    }
+
+    private void debug(String message) {
+        if (debug) plugin.getLogger().info("[apw-debug] " + message);
     }
 
     /**
@@ -76,12 +82,12 @@ public final class PlayerDataListener implements Listener {
         var fromGroup = groupManager.resolve(previous);
         var toGroup = groupManager.resolve(current);
 
-        plugin.getLogger().info("[apw-debug] " + player.getName() + " world-poll detected change: "
+        debug(player.getName() + " world-poll detected change: "
                 + previous + " (group '" + fromGroup.name() + "') -> "
                 + current + " (group '" + toGroup.name() + "')");
 
         if (fromGroup.name().equals(toGroup.name())) {
-            plugin.getLogger().info("[apw-debug] same group, skipping swap");
+            debug("same group, skipping swap");
             return;
         }
 
@@ -98,15 +104,14 @@ public final class PlayerDataListener implements Listener {
         var group = groupManager.resolve(player.getWorld());
         var file = snapshotFile(group, player.getUniqueId());
 
-        plugin.getLogger().info("[apw-debug] " + player.getName() + " joined into "
+        debug(player.getName() + " joined into "
                 + player.getWorld().getName() + " (group '" + group.name() + "'), forced game mode = "
                 + group.defaultGameMode().map(Enum::name).orElse("none"));
 
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             try {
                 var snapshot = PlayerSnapshot.load(file, syncGameMode);
-                plugin.getLogger().info("[apw-debug] join snapshot for group '" + group.name()
-                        + "' present = " + snapshot.isPresent());
+                debug("join snapshot for group '" + group.name() + "' present = " + snapshot.isPresent());
                 // Nothing to do if there's no stored data for this group AND no forced game mode.
                 if (snapshot.isEmpty() && group.defaultGameMode().isEmpty()) return;
 
@@ -115,10 +120,10 @@ public final class PlayerDataListener implements Listener {
                     snapshot.ifPresent(s -> s.apply(player));
                     // Forced game mode always wins over whatever the snapshot (or lack of one) set.
                     group.defaultGameMode().ifPresent(player::setGameMode);
-                    plugin.getLogger().info("[apw-debug] applied join state for " + player.getName());
+                    debug("applied join state for " + player.getName());
                 }, null);
             } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "[apw-debug] join handling failed", e);
+                plugin.getLogger().log(Level.SEVERE, "[AlmostPerWorlds] join handling failed", e);
             }
         });
     }
@@ -132,14 +137,14 @@ public final class PlayerDataListener implements Listener {
         var snapshot = PlayerSnapshot.capture(player, syncGameMode);
         var file = snapshotFile(group, player.getUniqueId());
 
-        plugin.getLogger().info("[apw-debug] " + player.getName() + " quit from "
+        debug(player.getName() + " quit from "
                 + player.getWorld().getName() + " (group '" + group.name() + "'), saving to " + file);
 
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             try {
                 snapshot.save(file);
             } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "[apw-debug] quit save failed", e);
+                plugin.getLogger().log(Level.SEVERE, "[AlmostPerWorlds] quit save failed", e);
             }
         });
     }
@@ -148,13 +153,13 @@ public final class PlayerDataListener implements Listener {
         var outgoingFile = snapshotFile(fromGroup, uuid);
         var incomingFile = snapshotFile(toGroup, uuid);
 
-        plugin.getLogger().info("[apw-debug] persisting to " + outgoingFile + ", loading from " + incomingFile);
+        debug("persisting to " + outgoingFile + ", loading from " + incomingFile);
 
         Bukkit.getAsyncScheduler().runNow(plugin, task -> {
             try {
                 outgoing.save(outgoingFile);
                 var incoming = PlayerSnapshot.load(incomingFile, syncGameMode);
-                plugin.getLogger().info("[apw-debug] saved outgoing, incoming snapshot present = " + incoming.isPresent());
+                debug("saved outgoing, incoming snapshot present = " + incoming.isPresent());
 
                 player.getScheduler().run(plugin, scheduledTask -> {
                     if (!player.isOnline()) return;
@@ -163,11 +168,10 @@ public final class PlayerDataListener implements Listener {
                     incoming.ifPresentOrElse(s -> s.apply(player), () -> clear(player));
                     // Forced game mode always wins over whatever the snapshot (or clearing) set.
                     toGroup.defaultGameMode().ifPresent(player::setGameMode);
-                    plugin.getLogger().info("[apw-debug] applied incoming state for " + player.getName()
-                            + ", now in group '" + toGroup.name() + "'");
+                    debug("applied incoming state for " + player.getName() + ", now in group '" + toGroup.name() + "'");
                 }, null);
             } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "[apw-debug] persistAndLoad failed", e);
+                plugin.getLogger().log(Level.SEVERE, "[AlmostPerWorlds] persistAndLoad failed", e);
             }
         });
     }

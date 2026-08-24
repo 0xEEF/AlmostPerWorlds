@@ -31,11 +31,12 @@ public final class AlmostPerWorlds extends JavaPlugin {
         saveDefaultConfig();
 
         var syncGameMode = getConfig().getBoolean("sync-game-mode", false);
+        var debug = getConfig().getBoolean("debug", false);
 
         groupManager = new GroupManager(this);
         groupManager.load();
 
-        playerDataListener = new PlayerDataListener(this, groupManager, syncGameMode);
+        playerDataListener = new PlayerDataListener(this, groupManager, syncGameMode, debug);
         getServer().getPluginManager().registerEvents(playerDataListener, this);
         playerDataListener.start();
 
