@@ -23,6 +23,7 @@ import java.util.List;
 public final class AlmostPerWorlds extends JavaPlugin {
 
     private GroupManager groupManager;
+    private PlayerDataListener playerDataListener;
 
     @Override
     public void onEnable() {
@@ -34,8 +35,9 @@ public final class AlmostPerWorlds extends JavaPlugin {
         groupManager = new GroupManager(this);
         groupManager.load();
 
-        getServer().getPluginManager().registerEvents(
-                new PlayerDataListener(this, groupManager, syncGameMode), this);
+        playerDataListener = new PlayerDataListener(this, groupManager, syncGameMode);
+        getServer().getPluginManager().registerEvents(playerDataListener, this);
+        playerDataListener.start();
 
         var groupCommand = new GroupCommand(groupManager);
 
@@ -71,6 +73,7 @@ public final class AlmostPerWorlds extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        if (playerDataListener != null) playerDataListener.stop();
         if (groupManager != null) groupManager.save();
     }
 
