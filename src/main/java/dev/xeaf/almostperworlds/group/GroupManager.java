@@ -34,6 +34,7 @@ public final class GroupManager {
 
     public void load() {
         groups.clear();
+        defaultGroup.defaultGameMode(null);
 
         if (!groupsFile.exists()) {
             save();
@@ -45,10 +46,12 @@ public final class GroupManager {
         if (section == null) return;
 
         for (var name : section.getKeys(false)) {
-            if (name.equalsIgnoreCase(DEFAULT_GROUP)) continue; // reserved, ignore if present
-            var group = new WorldGroup(name);
-            for (var world : section.getStringList(name + ".worlds")) {
-                group.addWorld(world);
+            // The implicit default group has no world list, but its forced game mode must persist.
+            var group = name.equalsIgnoreCase(DEFAULT_GROUP) ? defaultGroup : new WorldGroup(name);
+            if (group != defaultGroup) {
+                for (var world : section.getStringList(name + ".worlds")) {
+                    group.addWorld(world);
+                }
             }
             var gameMode = section.getString(name + ".game-mode");
             if (gameMode != null) {
@@ -58,12 +61,14 @@ public final class GroupManager {
                     plugin.getLogger().warning("Unknown game-mode '" + gameMode + "' for group '" + name + "' in groups.yml, ignoring.");
                 }
             }
-            groups.put(name.toLowerCase(java.util.Locale.ROOT), group);
+            if (group != defaultGroup) groups.put(name.toLowerCase(java.util.Locale.ROOT), group);
         }
     }
 
     public void save() {
         var config = new YamlConfiguration();
+        config.set("groups." + DEFAULT_GROUP + ".game-mode",
+                defaultGroup.defaultGameMode().map(Enum::name).orElse(null));
         for (var group : groups.values()) {
             config.set("groups." + group.name() + ".worlds", group.worlds().stream().toList());
             config.set("groups." + group.name() + ".game-mode",

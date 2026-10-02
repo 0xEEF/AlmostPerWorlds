@@ -8,6 +8,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.Plugin;
@@ -15,7 +16,9 @@ import org.bukkit.plugin.Plugin;
 import java.io.File;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.logging.Level;
 
 /**
@@ -40,11 +43,33 @@ public final class PlayerDataListener implements Listener {
     private final Map<UUID, String> lastKnownWorld = new ConcurrentHashMap<>();
     private io.papermc.paper.threadedregions.scheduler.ScheduledTask pollingTask;
 
+    /**
+     * Per-player job chain. Swaps, joins and quits for the same player must run strictly in the
+     * order they were triggered; otherwise a quick A -> B -> A hop could load A's snapshot before
+     * the previous hop finished saving it (stale data / wrong game mode applied last).
+     */
+    private final Map<UUID, CompletableFuture<Void>> queues = new ConcurrentHashMap<>();
+    private final Executor asyncExecutor;
+
     public PlayerDataListener(Plugin plugin, GroupManager groupManager, boolean syncGameMode, boolean debug) {
         this.plugin = plugin;
         this.groupManager = groupManager;
         this.syncGameMode = syncGameMode;
         this.debug = debug;
+        this.asyncExecutor = r -> Bukkit.getAsyncScheduler().runNow(plugin, t -> r.run());
+    }
+
+    private void enqueue(UUID uuid, Runnable job) {
+        queues.compute(uuid, (id, previous) -> {
+            CompletableFuture<?> base = previous == null ? CompletableFuture.completedFuture(null) : previous;
+            return base.handle((r, ex) -> null).thenRunAsync(() -> {
+                try {
+                    job.run();
+                } catch (Exception e) {
+                    plugin.getLogger().log(Level.SEVERE, "[AlmostPerWorlds] player data job failed", e);
+                }
+            }, asyncExecutor);
+        });
     }
 
     private void debug(String message) {
@@ -95,6 +120,16 @@ public final class PlayerDataListener implements Listener {
         persistAndLoad(outgoing, uuid, fromGroup, toGroup, player);
     }
 
+    /**
+     * Reacts immediately where the event does fire (Paper). The poller remains the fallback for
+     * Folia; both funnel through {@link #checkForWorldChange}, which de-duplicates via
+     * {@code lastKnownWorld}, so a change is never processed twice.
+     */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onPlayerChangedWorld(PlayerChangedWorldEvent event) {
+        checkForWorldChange(event.getPlayer());
+    }
+
     @EventHandler(priority = EventPriority.LOWEST)
     public void onPlayerJoin(PlayerJoinEvent event) {
         var player = event.getPlayer();
@@ -108,23 +143,19 @@ public final class PlayerDataListener implements Listener {
                 + player.getWorld().getName() + " (group '" + group.name() + "'), forced game mode = "
                 + group.defaultGameMode().map(Enum::name).orElse("none"));
 
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            try {
-                var snapshot = PlayerSnapshot.load(file, syncGameMode);
-                debug("join snapshot for group '" + group.name() + "' present = " + snapshot.isPresent());
-                // Nothing to do if there's no stored data for this group AND no forced game mode.
-                if (snapshot.isEmpty() && group.defaultGameMode().isEmpty()) return;
+        enqueue(player.getUniqueId(), () -> {
+            var snapshot = PlayerSnapshot.load(file, syncGameMode);
+            debug("join snapshot for group '" + group.name() + "' present = " + snapshot.isPresent());
+            // Nothing to do if there's no stored data for this group AND no forced game mode.
+            if (snapshot.isEmpty() && group.defaultGameMode().isEmpty()) return;
 
-                player.getScheduler().run(plugin, scheduledTask -> {
-                    if (!player.isOnline()) return;
-                    snapshot.ifPresent(s -> s.apply(player));
-                    // Forced game mode always wins over whatever the snapshot (or lack of one) set.
-                    group.defaultGameMode().ifPresent(player::setGameMode);
-                    debug("applied join state for " + player.getName());
-                }, null);
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "[AlmostPerWorlds] join handling failed", e);
-            }
+            player.getScheduler().run(plugin, scheduledTask -> {
+                if (!player.isOnline()) return;
+                snapshot.ifPresent(s -> s.apply(player));
+                // Forced game mode always wins over whatever the snapshot (or lack of one) set.
+                group.defaultGameMode().ifPresent(player::setGameMode);
+                debug("applied join state for " + player.getName());
+            }, null);
         });
     }
 
@@ -140,13 +171,10 @@ public final class PlayerDataListener implements Listener {
         debug(player.getName() + " quit from "
                 + player.getWorld().getName() + " (group '" + group.name() + "'), saving to " + file);
 
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            try {
-                snapshot.save(file);
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "[AlmostPerWorlds] quit save failed", e);
-            }
-        });
+        var uuid = player.getUniqueId();
+        enqueue(uuid, () -> snapshot.save(file));
+        var tail = queues.get(uuid);
+        if (tail != null) tail.whenComplete((r, ex) -> queues.remove(uuid, tail));
     }
 
     private void persistAndLoad(PlayerSnapshot outgoing, UUID uuid, WorldGroup fromGroup, WorldGroup toGroup, Player player) {
@@ -155,24 +183,24 @@ public final class PlayerDataListener implements Listener {
 
         debug("persisting to " + outgoingFile + ", loading from " + incomingFile);
 
-        Bukkit.getAsyncScheduler().runNow(plugin, task -> {
-            try {
-                outgoing.save(outgoingFile);
-                var incoming = PlayerSnapshot.load(incomingFile, syncGameMode);
-                debug("saved outgoing, incoming snapshot present = " + incoming.isPresent());
+        enqueue(uuid, () -> {
+            outgoing.save(outgoingFile);
+            var incoming = PlayerSnapshot.load(incomingFile, syncGameMode);
+            debug("saved outgoing, incoming snapshot present = " + incoming.isPresent());
 
-                player.getScheduler().run(plugin, scheduledTask -> {
-                    if (!player.isOnline()) return;
-                    // No stored data yet for the destination group: clear so the player doesn't
-                    // carry the previous group's items into a group that's never seen them before.
-                    incoming.ifPresentOrElse(s -> s.apply(player), () -> clear(player));
-                    // Forced game mode always wins over whatever the snapshot (or clearing) set.
-                    toGroup.defaultGameMode().ifPresent(player::setGameMode);
-                    debug("applied incoming state for " + player.getName() + ", now in group '" + toGroup.name() + "'");
-                }, null);
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "[AlmostPerWorlds] persistAndLoad failed", e);
-            }
+            player.getScheduler().run(plugin, scheduledTask -> {
+                if (!player.isOnline()) return;
+                // No stored data yet for the destination group: clear so the player doesn't
+                // carry the previous group's items into a group that's never seen them before.
+                incoming.ifPresentOrElse(s -> s.apply(player), () -> {
+                    clear(player);
+                    // Fresh group: don't leak the previous group's game mode either.
+                    if (syncGameMode) player.setGameMode(Bukkit.getDefaultGameMode());
+                });
+                // Forced game mode always wins over whatever the snapshot (or clearing) set.
+                toGroup.defaultGameMode().ifPresent(player::setGameMode);
+                debug("applied incoming state for " + player.getName() + ", now in group '" + toGroup.name() + "'");
+            }, null);
         });
     }
 
