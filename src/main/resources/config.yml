@@ -1,5 +1,12 @@
-# If true, game mode is also stored/swapped per world group, not just inventory-related state.
-sync-game-mode: false
+# Game mode is always stored per world group (together with inventory, XP, etc.), so a player's
+# game mode in one group never leaks into another. A group's configured game mode
+# (/apw gamemode <group> <mode>) is only the starting game mode for players who have never
+# been in that group before.
+
+# If true, a player's last location (x/y/z, rotation and which world of the group) is saved per
+# group and they are teleported back to it when they re-enter that group from another group.
+# First visits to a group are never teleported. Set to false to keep wherever the player arrived.
+restore-location: true
 
 # If true, logs every join/quit/group-swap decision with an [apw-debug] prefix - useful when
 # something isn't behaving as expected. Leave off for normal use, it's noisy.

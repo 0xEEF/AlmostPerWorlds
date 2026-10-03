@@ -1,6 +1,7 @@
 package dev.xeaf.almostperworlds.listener;
 
 import dev.xeaf.almostperworlds.data.PlayerSnapshot;
+import dev.xeaf.almostperworlds.data.StoredLocation;
 import dev.xeaf.almostperworlds.group.GroupManager;
 import dev.xeaf.almostperworlds.group.WorldGroup;
 import org.bukkit.Bukkit;
@@ -11,6 +12,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.plugin.Plugin;
 
 import java.io.File;
@@ -36,11 +38,13 @@ public final class PlayerDataListener implements Listener {
 
     private final Plugin plugin;
     private final GroupManager groupManager;
-    private final boolean syncGameMode;
+    private final boolean restoreLocation;
     private final boolean debug;
 
     /** The world each online player was in as of the last poll, so we can detect a change. */
     private final Map<UUID, String> lastKnownWorld = new ConcurrentHashMap<>();
+    /** Where each online player was as of the last poll/teleport, i.e. their position in the group they're about to leave. */
+    private final Map<UUID, StoredLocation> lastKnownLocation = new ConcurrentHashMap<>();
     private io.papermc.paper.threadedregions.scheduler.ScheduledTask pollingTask;
 
     /**
@@ -51,10 +55,10 @@ public final class PlayerDataListener implements Listener {
     private final Map<UUID, CompletableFuture<Void>> queues = new ConcurrentHashMap<>();
     private final Executor asyncExecutor;
 
-    public PlayerDataListener(Plugin plugin, GroupManager groupManager, boolean syncGameMode, boolean debug) {
+    public PlayerDataListener(Plugin plugin, GroupManager groupManager, boolean restoreLocation, boolean debug) {
         this.plugin = plugin;
         this.groupManager = groupManager;
-        this.syncGameMode = syncGameMode;
+        this.restoreLocation = restoreLocation;
         this.debug = debug;
         this.asyncExecutor = r -> Bukkit.getAsyncScheduler().runNow(plugin, t -> r.run());
     }
@@ -98,26 +102,44 @@ public final class PlayerDataListener implements Listener {
         if (pollingTask != null) pollingTask.cancel();
     }
 
+    /**
+     * Must run on the player's own thread (the callers below guarantee it). Everything that can
+     * throw is read BEFORE the tracking maps are updated, so a failure can never "consume" a
+     * world change and silently skip the swap.
+     */
     private void checkForWorldChange(Player player) {
-        var uuid = player.getUniqueId();
-        var current = player.getWorld().getName();
-        var previous = lastKnownWorld.put(uuid, current);
-        if (previous == null || previous.equals(current)) return; // no change (or first observation)
+        try {
+            var uuid = player.getUniqueId();
+            var location = player.getLocation();
+            var world = location.getWorld();
+            if (world == null) return;
+            var current = world.getName();
+            var here = StoredLocation.of(location);
 
-        var fromGroup = groupManager.resolve(previous);
-        var toGroup = groupManager.resolve(current);
+            var previous = lastKnownWorld.put(uuid, current);
+            var lastLocation = lastKnownLocation.put(uuid, here);
+            if (previous == null || previous.equals(current)) return; // no change (or first observation)
 
-        debug(player.getName() + " world-poll detected change: "
-                + previous + " (group '" + fromGroup.name() + "') -> "
-                + current + " (group '" + toGroup.name() + "')");
+            // Where the player was in the group they just left (not where they are now).
+            var departure = lastLocation != null && lastLocation.world().equals(previous) ? lastLocation : null;
 
-        if (fromGroup.name().equals(toGroup.name())) {
-            debug("same group, skipping swap");
-            return;
+            var fromGroup = groupManager.resolve(previous);
+            var toGroup = groupManager.resolve(current);
+
+            debug(player.getName() + " world change detected: "
+                    + previous + " (group '" + fromGroup.name() + "') -> "
+                    + current + " (group '" + toGroup.name() + "'), departure point = " + departure);
+
+            if (fromGroup.name().equals(toGroup.name())) {
+                debug("same group, skipping swap");
+                return;
+            }
+
+            var outgoing = PlayerSnapshot.capture(player, departure);
+            persistAndLoad(outgoing, uuid, fromGroup, toGroup, player);
+        } catch (Throwable t) {
+            plugin.getLogger().log(Level.SEVERE, "[AlmostPerWorlds] world change check failed for " + player.getName(), t);
         }
-
-        var outgoing = PlayerSnapshot.capture(player, syncGameMode);
-        persistAndLoad(outgoing, uuid, fromGroup, toGroup, player);
     }
 
     /**
@@ -127,7 +149,22 @@ public final class PlayerDataListener implements Listener {
      */
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerChangedWorld(PlayerChangedWorldEvent event) {
-        checkForWorldChange(event.getPlayer());
+        // Hop onto the player's own scheduler so this is Folia-safe wherever the event fires from.
+        var player = event.getPlayer();
+        player.getScheduler().run(plugin, task -> checkForWorldChange(player), null);
+    }
+
+    /**
+     * Remembers the exact departure point when a teleport crosses a group boundary (Paper). On
+     * Folia this event may not fire, in which case the poller's last-known location is used.
+     */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPlayerTeleport(PlayerTeleportEvent event) {
+        var from = event.getFrom().getWorld();
+        var to = event.getTo().getWorld();
+        if (from == null || to == null || from.equals(to)) return;
+        if (groupManager.resolve(from).name().equals(groupManager.resolve(to).name())) return;
+        lastKnownLocation.put(event.getPlayer().getUniqueId(), StoredLocation.of(event.getFrom()));
     }
 
     @EventHandler(priority = EventPriority.LOWEST)
@@ -135,25 +172,29 @@ public final class PlayerDataListener implements Listener {
         var player = event.getPlayer();
         // Seed the baseline immediately so the poller doesn't mistake "just joined" for a change.
         lastKnownWorld.put(player.getUniqueId(), player.getWorld().getName());
+        lastKnownLocation.put(player.getUniqueId(), StoredLocation.of(player.getLocation()));
 
         var group = groupManager.resolve(player.getWorld());
         var file = snapshotFile(group, player.getUniqueId());
 
         debug(player.getName() + " joined into "
-                + player.getWorld().getName() + " (group '" + group.name() + "'), forced game mode = "
+                + player.getWorld().getName() + " (group '" + group.name() + "'), starting game mode = "
                 + group.defaultGameMode().map(Enum::name).orElse("none"));
 
         enqueue(player.getUniqueId(), () -> {
-            var snapshot = PlayerSnapshot.load(file, syncGameMode);
+            var snapshot = PlayerSnapshot.load(file);
             debug("join snapshot for group '" + group.name() + "' present = " + snapshot.isPresent());
-            // Nothing to do if there's no stored data for this group AND no forced game mode.
+            // Never been in this group: keep whatever the player has, except apply the group's
+            // starting game mode (if any). Returning players just get their own saved state.
             if (snapshot.isEmpty() && group.defaultGameMode().isEmpty()) return;
 
             player.getScheduler().run(plugin, scheduledTask -> {
                 if (!player.isOnline()) return;
-                snapshot.ifPresent(s -> s.apply(player));
-                // Forced game mode always wins over whatever the snapshot (or lack of one) set.
-                group.defaultGameMode().ifPresent(player::setGameMode);
+                if (snapshot.isPresent()) {
+                    applyStored(player, snapshot.get(), group);
+                } else {
+                    group.defaultGameMode().ifPresent(player::setGameMode);
+                }
                 debug("applied join state for " + player.getName());
             }, null);
         });
@@ -163,9 +204,10 @@ public final class PlayerDataListener implements Listener {
     public void onPlayerQuit(PlayerQuitEvent event) {
         var player = event.getPlayer();
         lastKnownWorld.remove(player.getUniqueId());
+        lastKnownLocation.remove(player.getUniqueId());
 
         var group = groupManager.resolve(player.getWorld());
-        var snapshot = PlayerSnapshot.capture(player, syncGameMode);
+        var snapshot = PlayerSnapshot.capture(player, StoredLocation.of(player.getLocation()));
         var file = snapshotFile(group, player.getUniqueId());
 
         debug(player.getName() + " quit from "
@@ -185,23 +227,46 @@ public final class PlayerDataListener implements Listener {
 
         enqueue(uuid, () -> {
             outgoing.save(outgoingFile);
-            var incoming = PlayerSnapshot.load(incomingFile, syncGameMode);
+            var incoming = PlayerSnapshot.load(incomingFile);
             debug("saved outgoing, incoming snapshot present = " + incoming.isPresent());
 
             player.getScheduler().run(plugin, scheduledTask -> {
                 if (!player.isOnline()) return;
-                // No stored data yet for the destination group: clear so the player doesn't
-                // carry the previous group's items into a group that's never seen them before.
-                incoming.ifPresentOrElse(s -> s.apply(player), () -> {
+                debug("incoming snapshot location = " + incoming.flatMap(PlayerSnapshot::location).orElse(null));
+                if (incoming.isPresent()) {
+                    applyStored(player, incoming.get(), toGroup);
+                    if (restoreLocation) incoming.get().location().ifPresent(loc -> restore(player, loc, toGroup));
+                } else {
+                    // First visit to this group: start clean, never carry over the previous
+                    // group's items or game mode.
                     clear(player);
-                    // Fresh group: don't leak the previous group's game mode either.
-                    if (syncGameMode) player.setGameMode(Bukkit.getDefaultGameMode());
-                });
-                // Forced game mode always wins over whatever the snapshot (or clearing) set.
-                toGroup.defaultGameMode().ifPresent(player::setGameMode);
+                    player.setGameMode(toGroup.defaultGameMode().orElse(Bukkit.getDefaultGameMode()));
+                }
                 debug("applied incoming state for " + player.getName() + ", now in group '" + toGroup.name() + "'");
             }, null);
         });
+    }
+
+    /** Applies a stored snapshot, with its saved game mode (legacy files without one fall back to the group's start mode). */
+    private void applyStored(Player player, PlayerSnapshot snapshot, WorldGroup group) {
+        snapshot.apply(player);
+        player.setGameMode(snapshot.gameMode()
+                .or(group::defaultGameMode)
+                .orElse(Bukkit.getDefaultGameMode()));
+    }
+
+    /** Teleports the player back to where they last were in this group (if that spot is still valid). */
+    private void restore(Player player, StoredLocation stored, WorldGroup group) {
+        var world = Bukkit.getWorld(stored.world());
+        if (world == null || !groupManager.resolve(world).name().equals(group.name())) {
+            debug("not restoring location for " + player.getName() + ": world '" + stored.world()
+                    + "' is unloaded or no longer in group '" + group.name() + "'");
+            return;
+        }
+        debug("restoring " + player.getName() + " to " + stored);
+        player.teleportAsync(stored.toLocation(world), PlayerTeleportEvent.TeleportCause.PLUGIN)
+                .whenComplete((ok, ex) -> debug("restore teleport for " + player.getName() + " finished: ok=" + ok
+                        + (ex != null ? ", error=" + ex : "")));
     }
 
     private void clear(Player player) {

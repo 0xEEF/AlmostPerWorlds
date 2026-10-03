@@ -20,14 +20,13 @@ I am a random dev, and you should really not trust random stuff you find on the 
 - Food level, saturation, exhaustion
 - Health
 - Potion effects
-- Game mode - two independent, stackable options:
-  - `sync-game-mode` in `config.yml` (off by default): remembers each player's *own* last game
-    mode per group and restores it when they come back. Nothing is set the first time a player
-    enters a group.
-  - `/almostperworlds gamemode <group> <mode>`: force-sets *every* player to a fixed game mode
-    every time they enter that group (e.g. always Creative in your test world), overriding
-    whatever `sync-game-mode` would have restored. This is what you want for "world A is always
-    survival, world B is always creative."
+- Location (x/y/z, rotation and which world of the group) - when a player re-enters a group from
+  another group they're teleported back to where they last were in it. First visits are never
+  teleported. Disable with `restore-location: false` in `config.yml`.
+- Game mode - always saved per group, so it never leaks between groups. A player who returns to
+  a group gets back the game mode they had there. `/almostperworlds gamemode <group> <mode>` only
+  sets the *starting* game mode for players who have never been in that group (e.g. creative in
+  your test world); it is never re-applied to returning players.
 
 **Deliberately dropped (world-scoped, unsafe on Folia / not needed since "Worlds" owns this):**
 - Time, weather, difficulty/hardcore, game rule, and world border syncing across a group's worlds

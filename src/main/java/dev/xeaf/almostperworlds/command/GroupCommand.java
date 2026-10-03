@@ -131,8 +131,8 @@ public final class GroupCommand {
         }
         sender.sendMessage(ChatColor.GOLD + "Group '" + group.name() + "': " + ChatColor.RESET +
                 (group.worlds().isEmpty() ? "(no worlds assigned)" : String.join(", ", group.worlds())));
-        sender.sendMessage(ChatColor.GOLD + "Forced game mode: " + ChatColor.RESET +
-                group.defaultGameMode().map(Enum::name).orElse("(none - not managed)"));
+        sender.sendMessage(ChatColor.GOLD + "Starting game mode (first visit only): " + ChatColor.RESET +
+                group.defaultGameMode().map(Enum::name).orElse("(none)"));
     }
 
     private void gameMode(CommandSender sender, String[] args) {
@@ -148,7 +148,7 @@ public final class GroupCommand {
         if (args[2].equalsIgnoreCase("clear")) {
             group.defaultGameMode(null);
             groupManager.save();
-            sender.sendMessage(ChatColor.GREEN + "Cleared the forced game mode for group '" + group.name() + "'.");
+            sender.sendMessage(ChatColor.GREEN + "Cleared the starting game mode for group '" + group.name() + "'.");
             return;
         }
         GameMode mode;
@@ -160,7 +160,7 @@ public final class GroupCommand {
         }
         group.defaultGameMode(mode);
         groupManager.save();
-        sender.sendMessage(ChatColor.GREEN + "Group '" + group.name() + "' will now force game mode " + mode + " on entry.");
+        sender.sendMessage(ChatColor.GREEN + "Group '" + group.name() + "' will now put players who have never joined it in " + mode + ".");
     }
 
     private void sendUsage(CommandSender sender) {

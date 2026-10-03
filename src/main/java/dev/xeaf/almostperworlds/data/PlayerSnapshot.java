@@ -16,7 +16,7 @@ import java.util.Optional;
 
 /**
  * A snapshot of everything about a player that "belongs" to a world group: their inventory,
- * ender chest, XP, food and health state, and (optionally) game mode.
+ * ender chest, XP, food and health state, game mode (always stored, so it never leaks between groups) and the last location.
  * <p>
  * Capturing and applying a snapshot only ever touches the single player it was made for, so
  * both operations are safe to run directly on that player's own region thread on Folia -
@@ -37,13 +37,17 @@ public final class PlayerSnapshot {
     private double health = 20;
     private List<PotionEffect> potionEffects = List.of();
     private GameMode gameMode;
-
-    private boolean syncGameMode;
+    private StoredLocation location;
 
     private PlayerSnapshot() {
     }
 
-    public static PlayerSnapshot capture(Player player, boolean syncGameMode) {
+    /**
+     * @param location where the player is (or last was) inside the group being saved; {@code null}
+     *                 to store no location. Passed in explicitly because when a world change is
+     *                 detected the player is already standing in the new group.
+     */
+    public static PlayerSnapshot capture(Player player, StoredLocation location) {
         var snapshot = new PlayerSnapshot();
         var inventory = player.getInventory();
 
@@ -63,8 +67,8 @@ public final class PlayerSnapshot {
         snapshot.health = Math.min(player.getHealth(), maxHealth);
 
         snapshot.potionEffects = new ArrayList<>(player.getActivePotionEffects());
-        snapshot.syncGameMode = syncGameMode;
-        if (syncGameMode) snapshot.gameMode = player.getGameMode();
+        snapshot.gameMode = player.getGameMode();
+        snapshot.location = location;
 
         return snapshot;
     }
@@ -97,7 +101,16 @@ public final class PlayerSnapshot {
             player.addPotionEffect(effect);
         }
 
-        if (syncGameMode && gameMode != null) player.setGameMode(gameMode);
+    }
+
+    /** @return the last location stored for this group, or empty if none was saved. */
+    public Optional<StoredLocation> location() {
+        return Optional.ofNullable(location);
+    }
+
+    /** @return the game mode stored in this snapshot, or empty for legacy files saved without one. */
+    public Optional<GameMode> gameMode() {
+        return Optional.ofNullable(gameMode);
     }
 
     /**
@@ -117,7 +130,8 @@ public final class PlayerSnapshot {
         config.set("exhaustion", exhaustion);
         config.set("health", health);
         config.set("potion-effects", potionEffects);
-        if (syncGameMode && gameMode != null) config.set("game-mode", gameMode.name());
+        if (gameMode != null) config.set("game-mode", gameMode.name());
+        if (location != null) location.save(config.createSection("location"));
         try {
             file.getParentFile().mkdirs();
             config.save(file);
@@ -129,7 +143,7 @@ public final class PlayerSnapshot {
     /**
      * Reads a snapshot from disk. Safe to call off the main/region thread.
      */
-    public static Optional<PlayerSnapshot> load(File file, boolean syncGameMode) {
+    public static Optional<PlayerSnapshot> load(File file) {
         if (!file.exists()) return Optional.empty();
         var config = YamlConfiguration.loadConfiguration(file);
         var snapshot = new PlayerSnapshot();
@@ -153,9 +167,10 @@ public final class PlayerSnapshot {
         }
         snapshot.potionEffects = effects;
 
-        snapshot.syncGameMode = syncGameMode;
+        snapshot.location = StoredLocation.load(config.getConfigurationSection("location"));
+
         var gameModeName = config.getString("game-mode");
-        if (syncGameMode && gameModeName != null) {
+        if (gameModeName != null) {
             try {
                 snapshot.gameMode = GameMode.valueOf(gameModeName);
             } catch (IllegalArgumentException ignored) {

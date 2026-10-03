@@ -19,10 +19,9 @@ public final class WorldGroup {
     private final Set<String> worlds = new LinkedHashSet<>();
 
     /**
-     * When set, every player who enters this group has their game mode force-set to this value,
-     * overriding whatever they had before and taking priority over the "remember last game mode
-     * per player" behavior of {@code sync-game-mode}. When unset (the default), this plugin
-     * doesn't touch game mode for this group at all beyond whatever {@code sync-game-mode} does.
+     * When set, players who enter this group for the very first time (no stored data for it yet)
+     * start in this game mode. It is never applied again afterwards: each player's own game mode
+     * is saved per group and restored on return.
      */
     private GameMode defaultGameMode;
 
